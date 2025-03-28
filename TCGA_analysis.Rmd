@@ -1,0 +1,760 @@
+
+```{r}
+setwd('E:/Lorenzo/Final_TCGA')
+library(TCGAbiolinks)
+library(tidyverse)
+library(SummarizedExperiment)
+require(limma)
+require(edgeR)
+
+```
+
+
+```{r}
+projects_to_download = 'TCGA-BRCA'
+getGDCInfo()
+
+  BRCA_query <- GDCquery(project = projects_to_download,
+              data.category = "Transcriptome Profiling",
+              data.type = "Gene Expression Quantification", 
+              workflow.type = "STAR - Counts",
+              sample.type = c('Primary Tumor', 'Solid Tissue Normal'))
+
+GDCdownload(BRCA_query, directory = 'E:/Lorenzo/Final_TCGA/BRCA_data')
+
+BRCA <- GDCprepare(BRCA_query, directory = 'E:/Lorenzo/Final_TCGA/BRCA_data')
+
+BRCA_df <- assay(BRCA, 'unstranded') %>% as.data.frame(.)
+
+
+
+
+# now to extract clinical information of value from the data
+clinical_BRCA <- data.frame(BRCA$patient,BRCA$barcode,BRCA$age_at_diagnosis,BRCA$ajcc_pathologic_stage, BRCA$days_to_diagnosis, BRCA$vital_status, BRCA$days_to_death, BRCA$days_to_last_follow_up, BRCA$tumor_grade, BRCA$sample_type)
+colnames(clinical_BRCA) <- gsub('BRCA.', '', colnames(clinical_BRCA))
+
+clinical_BRCA$age_at_diagnosis <-  clinical_BRCA$age_at_diagnosis/365
+table(clinical_BRCA$sample_type)
+```
+
+```{r}  
+triple_neg_info <- read.delim('E:/Lorenzo/GDCdata/TCGA-BRCA/harmonized/Clinical/Clinical_Supplement/8162d394-8b64-4da2-9f5b-d164c54b9608/nationwidechildrens.org_clinical_patient_brca.txt', header = TRUE, sep = "\t")
+
+# remove top two rows of table as they are artefacts
+triple_neg_info <- triple_neg_info[3:nrow(triple_neg_info),]
+# information relating to the status is under the following columns
+# 'er_status_by_ihc'
+# 'pr_status_by_ihc'
+# 'her2_status_by_ihc',
+# possible values: "Positive"        "Negative"        "[Not Evaluated]" "Indeterminate"  
+
+triple_neg_info <- triple_neg_info %>% dplyr::select(c(bcr_patient_uuid,bcr_patient_barcode,er_status_by_ihc,pr_status_by_ihc,her2_status_by_ihc))
+
+
+#clinical_BRCA <- clinical_BRCA[match(triple_neg_info$bcr_patient_barcode, clinical_BRCA$patient),]
+clinical_BRCA$ER_status <- triple_neg_info[match(clinical_BRCA$patient, triple_neg_info$bcr_patient_barcode),]$er_status_by_ihc
+clinical_BRCA$PR_status <- triple_neg_info[match(clinical_BRCA$patient, triple_neg_info$bcr_patient_barcode),]$pr_status_by_ihc
+clinical_BRCA$HER2_status <- triple_neg_info[match(clinical_BRCA$patient, triple_neg_info$bcr_patient_barcode),]$her2_status_by_ihc
+
+# set TNBC status
+clinical_BRCA <- clinical_BRCA %>% 
+   mutate(TNBC_status = ifelse(ER_status == 'Positive' & 
+                PR_status == "Positive" &
+                HER2_status == "Positive", 
+                          "TNBC", "Other"))
+
+clinical_BRCA <- clinical_BRCA[!is.na(clinical_BRCA$barcode),]
+clinical_BRCA <- clinical_BRCA[!is.na(clinical_BRCA$ER_status),]
+#based on this subset the gene expression matrix to include only non-duplicated barcodes
+BRCA_df <- BRCA_df[,colnames(BRCA_df) %in% clinical_BRCA$barcode]
+```
+
+
+```{r}
+# Convert gene names from Ensemble IDs to gene symbols
+gene_names <- read.table(file = 'E:/Lorenzo/Final_TCGA/7f9dadec-d447-41be-a192-637ce36467da.rna_seq.augmented_star_gene_counts.tsv', sep = '\t', header = TRUE)[-c(1:4),] %>% dplyr::select(gene_id, gene_name) %>% group_by(gene_name) %>% filter(row_number() <= 1) %>% as.data.frame(.)
+
+
+BRCA_df <- BRCA_df[rownames(BRCA_df) %in% gene_names$gene_id,]
+
+rownames(BRCA_df) <- gene_names$gene_name[match(gene_names$gene_id, rownames(BRCA_df))]
+clinical_BRCA <- clinical_BRCA[!is.na(clinical_BRCA$ER_status),]
+
+clinical_BRCA$subtype <- 'Unclassified'
+
+clinical_BRCA[((clinical_BRCA$ER_status == 'Positive')|
+                (clinical_BRCA$PR_status == 'Positive')) &
+                (clinical_BRCA$HER2_status == 'Negative'), 
+                ]$subtype <- 'Luminal A' 
+
+clinical_BRCA[((clinical_BRCA$ER_status == 'Positive')|
+                (clinical_BRCA$PR_status == 'Positive')) &
+                (clinical_BRCA$HER2_status == 'Positive'), 
+                ]$subtype <- 'Luminal B' 
+
+clinical_BRCA[(clinical_BRCA$ER_status == 'Negative') &
+                (clinical_BRCA$PR_status == 'Negative') &
+                (clinical_BRCA$HER2_status == 'Positive'), 
+                ]$subtype <- 'Non-luminal HER2+' 
+
+clinical_BRCA[(clinical_BRCA$ER_status == 'Negative') &
+                (clinical_BRCA$PR_status == 'Negative') &
+                (clinical_BRCA$HER2_status == 'Negative'), 
+                ]$subtype <- 'Triple negative' 
+
+
+
+clinical_BRCA[clinical_BRCA$sample_type == 'Solid Tissue Normal',]$subtype <- 'Solid Tissue Normal'
+
+#remove missing sample
+BRCA <- BRCA[,(BRCA$barcode %in% clinical_BRCA$barcode)]
+
+BRCA$subtype <- clinical_BRCA$subtype
+```
+
+Gene normalization using Limma
+
+```{r, fig.width=10, fig.height=5}
+
+limma_pipeline = function(
+  tcga_data,
+  condition_variable,
+  reference_group=NULL){
+
+  design_factor = colData(tcga_data)[, condition_variable, drop=T]
+
+  group = factor(design_factor)
+  if(!is.null(reference_group)){group = relevel(group, ref=reference_group)}
+
+  design = model.matrix(~ group)
+
+  dge = DGEList(counts=assay(tcga_data),
+                 samples=colData(tcga_data),
+                 genes=as.data.frame(rowData(tcga_data)))
+
+  # filtering
+  keep = filterByExpr(dge,design)
+  dge = dge[keep,,keep.lib.sizes=FALSE]
+  rm(keep)
+
+  # Normalization (TMM followed by voom)
+  dge = calcNormFactors(dge)
+  v = voom(dge, design, plot=TRUE)
+
+  # Fit model to data given design
+  fit = lmFit(v, design)
+  fit = eBayes(fit)
+
+  # Show top genes
+  topGenes = topTable(fit, coef=ncol(design), number=100, sort.by="p")
+
+  return(
+    list(
+      voomObj=v, # normalized data
+      fit=fit, # fitted model and statistics
+      topGenes=topGenes # the 100 most differentially expressed genes
+    )
+  )
+}
+
+limma_res = limma_pipeline(
+  tcga_data=BRCA,
+  condition_variable="subtype",
+  reference_group="Solid Tissue Normal"
+)
+
+saveRDS(object = limma_res,
+        file = "E:/Lorenzo/Final_TCGA/limma_res.RDS",
+        compress = FALSE)
+
+
+group = factor(limma_res$voomObj$targets[, "subtype"])
+pca = prcomp(t(limma_res$voomObj$E))
+pca_df <- pca$x[,1:2] %>% as.data.frame(.)
+pca_df$group = group
+
+require(ggpubr)
+require(RColorBrewer)
+
+pca_df$group <- factor(
+pca_df$group, levels = c('Solid Tissue Normal','Unclassified','Luminal A','Luminal B','Non-luminal HER2+','Triple negative'))
+
+c5 <- c(
+  "orange", 
+  "dodgerblue2", # red
+  "#6A3D9A", # purple
+  "#FF7F00", # orange
+  "olivedrab")
+
+
+
+png('C:/Users/Admin/Laud_BRCA_final_figures/PCA_by_cancer_type.png', res = 175, width = 1200, height = 600)
+ggplot(pca_df %>%filter(group !='Unclassified'), aes(x = PC1, y = PC2, color = group)) +
+  geom_point(size = 2) + 
+  theme_pubclean() +
+    theme(legend.position="right") +
+  scale_color_manual(name = 'Tissue subtype', values = c5)
+dev.off()
+
+
+c6 <- c(
+  "orange", 
+  "dodgerblue2", # red
+  "#6A3D9A", # purple
+  "#FF7F00", # orange
+  "olivedrab",
+  "gold"
+)
+
+
+
+png('C:/Users/Admin/Laud_BRCA_final_figures/PCA_by_cancer_type_without_unknown.png', res = 175, width = 1200, height = 600)
+ggplot(pca_df %>% filter(group != 'Unclassified'), aes(x = PC1, y = PC2, color = group)) +
+  geom_point(size = 2) + 
+  theme_pubclean() +
+  theme(legend.position="bottom") +
+  scale_color_manual(name = 'Tissue\nsubtype', values = c6, labels = c('Solid\nTissue\nNormal',
+                                                                      'Luminal A',
+                                                                      'Luminal B',
+                                                                      'Non-luminal HER-2+',
+                                                                      'Triple\nnegative')) 
+
+dev.off()
+
+
+
+```
+
+# start by ploting LAG3 expression across the sample subsets
+
+```{r}
+
+d_mat = as.matrix(t(limma_res$voomObj$E))
+
+temp <- clinical_BRCA %>% dplyr::select(barcode,sample_type,subtype)
+
+LAG3_gene_counts <- d_mat[,grep('ENSG00000089692',colnames(d_mat))] %>% as.data.frame(.)
+names(LAG3_gene_counts) <- 'LAG3_counts'
+
+LAG3_gene_counts$subtype <- temp[match(temp$barcode, rownames(LAG3_gene_counts)),]$subtype
+
+LAG3_gene_counts$subtype <- factor(
+LAG3_gene_counts$subtype, levels = c('Solid Tissue Normal','Unclassified','Luminal A','Luminal B','Non-luminal HER2+','Triple negative'))
+
+
+require(ggpubr)
+my_comparisons <- list(  c('Solid Tissue Normal','Luminal A'),c('Luminal A','Luminal B'),
+    c('Luminal A','Non-luminal HER2+'),
+    c('Luminal A', 'Triple negative') )
+
+
+
+png('C:/Users/Admin/Laud_BRCA_final_figures/LAG3_expression_across_cancer_subtypes.png', width = 1000, height = 600, res = 200)
+LAG3_gene_counts %>% filter(subtype != 'Unclassified')  %>%  ggplot(., aes(x = subtype, y = LAG3_counts, fill = subtype)) + 
+  geom_violin(draw_quantiles = c(0.25, 0.5, 0.75), show.legend = F) + 
+  xlab('Tissue subtype') +
+  ylab('Normalized gene counts of LAG-3') +
+  theme_pubclean() + 
+  stat_compare_means(comparisons = my_comparisons,label = "p.signif", tip.length = 0.02, step.increase = 0.05, bracket.size = 0.05, vjust = 0.5)+
+  scale_x_discrete(labels = c('Normal\ntissue','Luminal A','Luminal B','Non-luminal\nHER2+','Triple\nnegative')) +
+  scale_fill_manual(values =  c6)
+dev.off()
+
+    
+```
+
+# plot survival by LAG3
+
+```{r}
+require(ClusterR)
+require(survminer)
+require(survival)
+
+BRCA_survival <- clinical_BRCA %>% as_tibble %>% 
+  add_column("times"=NA %>% as.integer(), .before=8)
+
+for (i in 1:nrow(BRCA_survival)){
+  if (is.na( (BRCA_survival[i , ]$days_to_death)) ){
+    BRCA_survival[i , ]$times <- BRCA_survival[i , ]$"days_to_last_follow_up"
+  }else
+  {
+    BRCA_survival[i , ]$times <- BRCA_survival[i , ]$"days_to_death"
+  }
+}
+
+BRCA_survival$times <- as.integer(BRCA_survival$times)
+
+BRCA_survival$vital_status <- recode(BRCA_survival$vital_status, 
+                                   Alive="0", Dead="1", `Not Reported` = NA_character_
+)
+BRCA_survival$vital_status <- as.numeric(BRCA_survival$vital_status)
+
+
+BRCA_survival$LAG3_gene_counts <- LAG3_gene_counts[match(rownames(LAG3_gene_counts), BRCA_survival$barcode),]$LAG3_counts
+
+medoids_lag3 <- Cluster_Medoids( center_scale( as.matrix(BRCA_survival %>% dplyr::select(LAG3_gene_counts)), 
+                                                  mean_center = T, sd_scale = T ),
+                                    clusters = 2, 
+                                    distance_metric = "manhattan", 
+                                    swap_phase = T, 
+                                    seed = 123)
+
+BRCA_survival$LAG3_cluster <- medoids_lag3$clusters
+
+
+BRCA_survival <- BRCA_survival %>% 
+  mutate(LAG3_cluster = ifelse(LAG3_cluster == BRCA_survival %>% group_by(LAG3_cluster) %>%summarize(mean_LAG3 = mean(LAG3_gene_counts)) %>% .[.$mean_LAG3 ==max(.$mean_LAG3),] %>% dplyr::select('LAG3_cluster') %>% .$'LAG3_cluster', 'LAG3 high', 'LAG3 low'))
+
+
+fit_by_types <- survfit(Surv( times, vital_status ) ~ LAG3_cluster,
+               data = BRCA_survival %>% filter(subtype != 'Solid Tissue Normal'))
+
+png('C:/Users/Admin/Laud_BRCA_final_figures/survival_by_LAG3.png', width = 1200, height = 700, res = 130)
+ggsurvplot(fit_by_types, BRCA_survival %>% filter(subtype != 'Solid Tissue Normal'),
+                    legend.labs = c("LAG3 high", "LAG3 low"),
+
+                    #palette = c6,
+                    risk.table = T, 
+                    risk.table.height = 0.3,
+                    pval = TRUE, 
+                    pval.coord = c(1500, 0.95),
+                    ggtheme = theme_survminer(),
+                    xlim=c(0,3000), 
+                    ylim = c(0.4,1),
+                    break.x.by = 500,
+                   # title = c("CTL Clustering"),
+                    xlab = c("Time (days)"),
+                    tables.y.text = F,
+                    ncol=2,
+           legend.title ='LAG3 expression cluster',
+           font.legend = c(12,'bold','black'))
+dev.off()
+
+# plot by top 10 vs bottom 90 percent of expression
+
+BRCA_survival$LAG3_ntile <- ntile(BRCA_survival$LAG3_gene_counts, 20)
+
+BRCA_survival <- BRCA_survival %>% 
+  mutate(LAG3_ntile = case_when(LAG3_ntile <= 17 ~ "LAG3 low",
+                        LAG3_ntile > 17  ~ "LAG3 high"))
+
+
+fit_by_types <- survfit(Surv( times, vital_status ) ~ LAG3_ntile,
+               data = BRCA_survival %>% filter(subtype != 'Solid Tissue Normal'))
+
+
+png('C:/Users/Admin/Laud_BRCA_final_figures/survival_by_LAG3_top10.png', width = 1200, height = 700, res = 130)
+ggsurvplot(fit_by_types, BRCA_survival %>% filter(subtype != 'Solid Tissue Normal'),
+                    legend.labs = c("LAG3 high", "LAG3 low"),
+                    #palette = c6,
+                    risk.table = T, 
+                    risk.table.height = 0.3,
+                    pval = TRUE, 
+                    pval.coord = c(1500, 0.95),
+                    ggtheme = theme_survminer(),
+                    xlim=c(0,4000), 
+                    ylim = c(0.4,1),
+                    break.x.by = 500,
+                   # title = c("CTL Clustering"),
+                    xlab = c("Time (days)"),
+                    tables.y.text = F,
+                    ncol=2,
+           legend.title ='LAG3 expression cluster',
+           font.legend = c(12,'bold','black'),
+           log.rank.weights = 'S2')
+dev.off()
+```
+
+# plot survival by FGL1
+
+```{r}
+selected_gene_counts <- d_mat[,grep('ENSG00000104760',colnames(d_mat))] %>% as.data.frame(.)
+names(selected_gene_counts) <- 'FGL1'
+rownames(selected_gene_counts) <- rownames(d_mat)
+
+BRCA_survival$FGL1_gene_counts <- selected_gene_counts[match(rownames(selected_gene_counts), BRCA_survival$barcode),]
+
+medoids_fgl1 <- Cluster_Medoids( center_scale( as.matrix(BRCA_survival %>% dplyr::select(FGL1_gene_counts)), 
+                                                  mean_center = T, sd_scale = T ),
+                                    clusters = 2, 
+                                    distance_metric = "manhattan", 
+                                    swap_phase = T, 
+                                    seed = 123)
+
+BRCA_survival$FGL1_cluster <- medoids_fgl1$clusters
+
+
+BRCA_survival <- BRCA_survival %>% 
+  mutate(FGL1_cluster = ifelse(FGL1_cluster == BRCA_survival %>% group_by(FGL1_cluster) %>%summarize(mean_FGL1 = mean(FGL1_gene_counts)) %>% .[.$mean_FGL1 ==max(.$mean_FGL1),] %>% dplyr::select('FGL1_cluster') %>% .$'FGL1_cluster', 'FGL1 high', 'FGL1 low'))
+
+
+fit_by_types <- survfit(Surv( times, vital_status ) ~ FGL1_cluster,
+               data = BRCA_survival %>% filter(subtype != 'Solid Tissue Normal'))
+
+png('C:/Users/Admin/Laud_BRCA_final_figures/survival_by_FGL1.png', width = 1200, height = 700, res = 130)
+ggsurvplot(fit_by_types, BRCA_survival %>% filter(subtype != 'Solid Tissue Normal'),
+                    legend.labs = c("FGL1 high", "FGL1 low"),
+
+                    #palette = c6,
+                    risk.table = T, 
+                    risk.table.height = 0.3,
+                    pval = TRUE, 
+                    pval.coord = c(1500, 0.95),
+                    ggtheme = theme_survminer(),
+                    xlim=c(0,3000), 
+                    ylim = c(0.4,1),
+                    break.x.by = 500,
+                   # title = c("CTL Clustering"),
+                    xlab = c("Time (days)"),
+                    tables.y.text = F,
+                    ncol=2,
+           legend.title ='FGL1 expression cluster',
+           font.legend = c(12,'bold','black'))
+dev.off()
+```
+
+# Not included in paper
+#plot survival by Galectin-3
+
+```{r}
+selected_gene_counts <- d_mat[,grep('ENSG00000131981',colnames(d_mat))] %>% as.data.frame(.)
+names(selected_gene_counts) <- 'Gal3'
+rownames(selected_gene_counts) <- rownames(d_mat)
+
+BRCA_survival$Gal3_gene_counts <- selected_gene_counts[match(rownames(selected_gene_counts), BRCA_survival$barcode),]
+
+medoids_gal3 <- Cluster_Medoids( center_scale( as.matrix(BRCA_survival %>% dplyr::select(Gal3_gene_counts)), 
+                                                  mean_center = T, sd_scale = T ),
+                                    clusters = 2, 
+                                    distance_metric = "manhattan", 
+                                    swap_phase = T, 
+                                    seed = 123)
+
+BRCA_survival$Gal3_cluster <- medoids_gal3$clusters
+
+
+BRCA_survival <- BRCA_survival %>% 
+  mutate(Gal3_cluster = ifelse(Gal3_cluster == BRCA_survival %>% group_by(Gal3_cluster) %>%summarize(mean_Gal3 = mean(Gal3_gene_counts)) %>% .[.$mean_Gal3 ==max(.$mean_Gal3),] %>% dplyr::select('Gal3_cluster') %>% .$'Gal3_cluster', 'Gal3 high', 'Gal3 low'))
+
+
+fit_by_types <- survfit(Surv( times, vital_status ) ~ Gal3_cluster,
+               data = BRCA_survival %>% filter(subtype != 'Solid Tissue Normal'))
+
+png('C:/Users/Admin/Laud_BRCA_final_figures/survival_by_Gal3.png', width = 1200, height = 700, res = 130)
+ggsurvplot(fit_by_types, BRCA_survival %>% filter(subtype != 'Solid Tissue Normal'),
+                    legend.labs = c("Gal3 high", "Gal3 low"),
+                    #palette = c6,
+                    risk.table = T, 
+                    risk.table.height = 0.3,
+                    pval = TRUE, 
+                    pval.coord = c(1500, 0.95),
+                    ggtheme = theme_survminer(),
+                    xlim=c(0,3000), 
+                    ylim = c(0.4,1),
+                    break.x.by = 500,
+                   # title = c("CTL Clustering"),
+                    xlab = c("Time (days)"),
+                    tables.y.text = F,
+                    ncol=2,
+           legend.title ='Gal3 expression cluster',
+           font.legend = c(12,'bold','black'))
+dev.off()
+```
+
+# Not incldued in paper
+#plot survival by LSECtin
+
+```{r}
+grep('ENSG00000182566',colnames(d_mat))
+#lsectin not present so filtered out
+```
+
+# Not incldued in paper
+#plot survival by HLA-DRA
+
+```{r}
+selected_gene_counts <- d_mat[,grep('ENSG00000204287',colnames(d_mat))] %>% as.data.frame(.)
+names(selected_gene_counts) <- 'HLADR'
+rownames(selected_gene_counts) <- rownames(d_mat)
+
+BRCA_survival$HLADR_gene_counts <- selected_gene_counts[match(rownames(selected_gene_counts), BRCA_survival$barcode),]
+
+medoids_hldra <- Cluster_Medoids( center_scale( as.matrix(BRCA_survival %>% dplyr::select(HLADR_gene_counts)), 
+                                                  mean_center = T, sd_scale = T ),
+                                    clusters = 2, 
+                                    distance_metric = "manhattan", 
+                                    swap_phase = T, 
+                                    seed = 123)
+
+BRCA_survival$HLADRA_cluster <- medoids_hldra$clusters
+
+
+BRCA_survival <- BRCA_survival %>% 
+  mutate(HLADRA_cluster = ifelse(HLADRA_cluster == BRCA_survival %>% group_by(HLADRA_cluster) %>%summarize(mean_HLADRA = mean(HLADR_gene_counts)) %>% .[.$mean_HLADRA ==max(.$mean_HLADRA),] %>% dplyr::select('HLADRA_cluster') %>% .$'HLADRA_cluster', 'HLA-DRA high', 'HLA-DRA low'))
+
+
+fit_by_types <- survfit(Surv( times, vital_status ) ~ HLADRA_cluster,
+               data = BRCA_survival %>% filter(subtype != 'Solid Tissue Normal'))
+
+png('C:/Users/Admin/Laud_BRCA_final_figures/survival_by_HLADRA.png', width = 1200, height = 700, res = 130)
+ggsurvplot(fit_by_types, BRCA_survival %>% filter(subtype != 'Solid Tissue Normal'),
+                    legend.labs = c("HLA-DRA high", "HLA-DRA low"),
+                    #palette = c6,
+                    risk.table = T, 
+                    risk.table.height = 0.3,
+                    pval = TRUE, 
+                    pval.coord = c(1500, 0.95),
+                    ggtheme = theme_survminer(),
+                    xlim=c(0,3000), 
+                    ylim = c(0.4,1),
+                    break.x.by = 500,
+                   # title = c("CTL Clustering"),
+                    xlab = c("Time (days)"),
+                    tables.y.text = F,
+                    ncol=2,
+           legend.title ='HLA-DRA expression cluster',
+           font.legend = c(12,'bold','black'))
+dev.off()
+```
+
+
+# Survival curves based on tumour subtype
+# Not included in paper
+
+```{r}
+require(survival)
+require(survminer)
+
+fit_by_types <- survfit(Surv( times, vital_status ) ~ subtype,
+               data = BRCA_survival %>% filter(subtype != 'Solid Tissue Normal')%>% filter(subtype != 'Unclassified'))
+
+png('C:/Users/Admin/Laud_BRCA_final_figures/survival_by_cancer_types.png', width = 1200, height = 700, res = 130)
+ggsurvplot(fit_by_types, BRCA_survival %>% filter(subtype != 'Solid Tissue Normal')%>% filter(subtype != 'Unclassified'),
+                    legend.labs = c("Luminal A", "Luminal B",
+                                    'Non-luminal HER2+','Triple negative'),
+                    palette = c6,
+                    risk.table = T, 
+                    risk.table.height = 0.3,
+                    pval = TRUE, 
+                    pval.coord = c(1500, 0.95),
+                    ggtheme = theme_survminer(),
+                    xlim=c(0,3000), 
+                    ylim = c(0.4,1),
+                    break.x.by = 500,
+                   # title = c("CTL Clustering"),
+                    xlab = c("Time (days)"),
+                    tables.y.text = F,
+                    ncol=2,
+           legend.title ='Tumour classification',
+           font.legend = c(12,'bold','black')
+           )
+dev.off()
+```
+
+# save for cibersort
+# not included in paper
+
+```{r}
+
+LM22 <- read.table('C:/Users/Standard User/Downloads/LM22.txt', sep = '\t', header = T )
+
+
+d_mat_export_brca <- d_mat[rownames(d_mat) %in% (BRCA_survival %>% filter(subtype != 'Solid Tissue Normal') %>% .$barcode),] 
+
+d_mat_export_brca <- d_mat_export_brca %>% t(.) %>% as.data.frame(.)
+d_mat_export_brca$Gene <- rownames(d_mat_export_brca)
+d_mat_export_brca <- d_mat_export_brca[, c(ncol(d_mat_export_brca),1:(ncol(d_mat_export_brca)-1))]
+d_mat_export_brca$Gene <- gene_names[match(d_mat_export_brca$Gene , gene_names$gene_id),]$gene_name
+
+# filter to include only the genes included in the LM22 matrix
+d_mat_export_brca <- d_mat_export_brca %>% filter(Gene %in% LM22$Gene.symbol)
+
+write.table(d_mat_export_brca,file = 'E:/Lorenzo/BRCA_laud_paper/BRCA_Laud_norm_counts.txt',sep="\t",row.names=F, col.names = T)
+
+```
+
+
+# Load CIBERSORT data and assess survival by CD8 T cells 
+```{r}
+require(PCFAM)
+require(ClusterR)
+require(survival)
+require(survminer)
+
+BRCA_cbsrt <- read.csv('C:/Users/Admin/Laud_BRCA_final_figures/BRCA_cibersort_limma.csv') %>% filter(Mixture %in% BRCA_survival$barcode)
+```
+
+# Lets try to cluster by CD8 T cell from CIBERSORTx
+
+```{r}
+BRCA_survival_tumour <- BRCA_survival %>% filter(subtype != 'Solid Tissue Normal')
+
+CTL_signature <- c('CD3D',	'CD3E',	'CD3G',	'CD8A',	'PTPRC')
+CTL_genes <- c('ENSG00000167286',	'ENSG00000198851',	'ENSG00000160654',	
+               'ENSG00000153563',	'ENSG00000081237')
+
+CytoTox_signature <- c('GNLY',	'GZMA',	'GZMB',
+                       'GZMH',	'GZMK',	'PRF1')
+CytoTox_genes <- c('ENSG00000115523',	'ENSG00000145649',	'ENSG00000100453',
+                   'ENSG00000100450',	'ENSG00000113088',	
+                   'ENSG00000180644')
+LAG3_signature <- c('LAG3')
+LAG3_gene <- c('ENSG00000089692')
+
+signature <- c(CTL_signature, 
+               CytoTox_signature,
+               LAG3_signature
+               )
+
+genes <- c(CTL_genes, 
+           CytoTox_genes,
+           LAG3_gene
+           )
+CTL_df <- lapply(genes, function(x){
+  output <- d_mat[,grep(x,colnames(d_mat))] %>% as.data.frame(.)
+  names(output) <- signature[grep(x, genes)]
+  return(output)
+}) %>% bind_cols(.)
+
+CTL_df <- CTL_df[rownames(CTL_df) %in% BRCA_survival$barcode,]
+
+
+
+  CTL_df_tumour <- CTL_df[rownames(CTL_df) %in% BRCA_survival_tumour$barcode,]
+
+  
+CTL_df_tumour$T.cell.CD8 <-  BRCA_cbsrt[match(BRCA_cbsrt$Mixture, rownames(CTL_df_tumour)),]$T.cells.CD8
+
+CTL_df_tumour$CD8_ntile <-  ntile(CTL_df_tumour$T.cell.CD8, 20)
+CTL_df_tumour <- CTL_df_tumour %>% 
+  mutate(CD8_ntile = case_when(CD8_ntile <= 10 ~ "CD8 low",
+                        CD8_ntile > 10  ~ "CD8 high"))
+
+
+BRCA_survival_tumour$CD8_ntile <- CTL_df_tumour[match(rownames(CTL_df_tumour), BRCA_survival_tumour$barcode),]$CD8_ntile
+
+fit_by_types <- survfit(Surv( times, vital_status ) ~CD8_ntile,
+               data = BRCA_survival_tumour)
+
+#png('C:/Users/Admin/Laud_BRCA_final_figures/survival_by_CD8_T_cell.png', width = 1000, height = 600, res = 130)
+ggsurvplot(fit_by_types, BRCA_survival_tumour,
+                    palette = c("red3", "steelblue3"),
+           legend.labs = c('CD8 T cell high','CD8 T cell low'),
+                    risk.table = T, 
+                    risk.table.height = 0.3,
+                    pval = T, 
+                    pval.coord = c(2000, 0.96),
+                    ggtheme = theme_survminer(),
+                    xlim=c(0.4,3250), 
+                    ylim = c(0.4,1),
+                    break.x.by = 500,
+                    xlab = c("Time (days)"),
+                    tables.y.text = F,
+                    ncol=2,
+           legend.title ='CD8 T cell group',
+           font.legend = c(12,'bold','black')) 
+
+
+#dev.off()
+```
+
+
+
+```{r}
+BRCA_survival_tumour$T.cells.CD8<-BRCA_cbsrt$T.cells.CD8[match(BRCA_cbsrt$Mixture,BRCA_survival_tumour$barcode)]
+
+
+BRCA_survival_tumour$CBRST_CD8_ntile <-  ntile(BRCA_survival_tumour$T.cells.CD8, 100)
+BRCA_survival_tumour <- BRCA_survival_tumour %>% 
+  mutate(CBRST_CD8_ntile = case_when(CBRST_CD8_ntile <= 50 ~ "CD8 low",
+                        CBRST_CD8_ntile > 50  ~ "CD8 high"))
+
+
+fit_by_types <- survfit(Surv( times, vital_status ) ~ CBRST_CD8_ntile,
+               data = BRCA_survival_tumour)
+
+png('C:/Users/Admin/Laud_BRCA_final_figures/survival_by_CD8_T_cell.png', width = 1000, height = 600, res = 130)
+ggsurvplot(fit_by_types, BRCA_survival_tumour,
+                   # palette = c("red3", "steelblue3"),
+           #legend.labs = c('CD8 T cell high','CD8 T cell low'),
+                    risk.table = T, 
+                    risk.table.height = 0.3,
+                    pval = T, 
+                    pval.coord = c(2000, 0.96),
+                    ggtheme = theme_survminer(),
+                    xlim=c(0.4,3250), 
+                    ylim = c(0.4,1),
+                    break.x.by = 500,
+                    xlab = c("Time (days)"),
+                    tables.y.text = F,
+                    ncol=2,
+           legend.title ='CD8 T cell group',
+           font.legend = c(12,'bold','black')) 
+
+
+dev.off()
+```
+
+
+# Now double cluster CD8 and LAG3 by top 20% of LAG3
+```{r}
+BRCA_survival_tumour <- BRCA_survival_tumour %>% split(., f = .$CBRST_CD8_ntile) %>% lapply(., function(x){
+  x$LAG3_ntile <-  ntile(x$LAG3_gene_counts, 100)
+  x <- x %>% 
+  mutate(LAG3_ntile = case_when(LAG3_ntile < 19 ~ "LAG3 low",
+                        LAG3_ntile >= 19  ~ "LAG3 high"))
+}) %>% bind_rows(.) %>% arrange(match(barcode, BRCA_survival_tumour$barcode))
+BRCA_survival_tumour$CD8_and_LAG3 <- paste(BRCA_survival_tumour$CBRST_CD8_ntile, BRCA_survival_tumour$LAG3_ntile)
+
+
+
+fit_by_types <- survfit(Surv( times, vital_status ) ~ CD8_and_LAG3,
+               data = BRCA_survival_tumour %>% filter(CBRST_CD8_ntile == 'CD8 high'))
+
+png('C:/Users/Admin/Laud_BRCA_final_figures/CD8high_LAG3_survival.png', width = 1000, height = 600, res = 110)
+ggsurvplot(fit_by_types,  BRCA_survival_tumour %>% filter(CBRST_CD8_ntile == 'CD8 high'),
+                    palette = c("red4", "red1"),
+                  legend.labs = c('CD8 T cell high\nLAG3 high','CD8 T cell high\nLAG3 low'),
+                    risk.table = T, 
+                    risk.table.height = 0.3,
+                    pval = T, 
+                    pval.coord = c(2000, 0.96),
+                    ggtheme = theme_survminer(),
+                    xlim=c(0,3250), 
+                    ylim = c(0.4,1),
+                    break.x.by = 500,
+                    xlab = c("Time (days)"),
+                    tables.y.text = F,
+                    ncol=2,
+           legend.title ='CD8 T cell and LAG3\nexpression group',
+           font.legend = c(12,'bold','black'))
+
+dev.off()
+
+fit_by_types <- survfit(Surv( times, vital_status ) ~ CD8_and_LAG3,
+               data = BRCA_survival_tumour %>% filter(CBRST_CD8_ntile == 'CD8 low'))
+
+png('C:/Users/Admin/Laud_BRCA_final_figures/CD8low_LAG3_survival.png', width = 1000, height = 600, res = 110)
+ggsurvplot(fit_by_types,  BRCA_survival_tumour %>% filter(CBRST_CD8_ntile == 'CD8 low'),
+                    palette = c("steelblue4", "steelblue1"),
+                  legend.labs = c('CD8 T cell low\nLAG3 high','CD8 T cell low\nLAG3 low'),
+                    risk.table = T, 
+                    risk.table.height = 0.3,
+                    pval = T, 
+                    pval.coord = c(2000, 0.96),
+                    ggtheme = theme_survminer(),
+                    xlim=c(0,3250), 
+                    ylim = c(0.4,1),
+                    break.x.by = 500,
+                    xlab = c("Time (days)"),
+                    tables.y.text = F,
+                    ncol=2,
+           legend.title ='CD8 T cell and LAG3\nexpression group',
+           font.legend = c(12,'bold','black'))
+
+dev.off()
+
+```
+
+
+
